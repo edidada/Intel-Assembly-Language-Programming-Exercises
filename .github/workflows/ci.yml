@@ -1,0 +1,370 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.os }} - assemble, link, run
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC x86 environment
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw 'vswhere.exe was not found.'
+          }
+
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) {
+            throw 'The MSVC x86/x64 build tools are not installed.'
+          }
+
+          $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars32.bat'
+          if (-not (Test-Path $vcvars)) {
+            throw "vcvars32.bat was not found at $vcvars."
+          }
+
+          $envLines = cmd /c "`"$vcvars`" >nul 2>&1 && set"
+          foreach ($line in $envLines) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+              "$($matches[1])=$($matches[2])" |
+                Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+          Write-Host "Using MSVC from: $vsPath"
+          Get-Command ml.exe, link.exe | Select-Object Name, Source
+
+      - name: Install Irvine32 headers and library
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $urls = @(
+            'https://asmirvine.com/gettingStartedVS2022/Irvine.zip',
+            'https://raw.githubusercontent.com/surferkip/asmbook/main/Irvine.zip'
+          )
+
+          $bytes = $null
+          foreach ($url in $urls) {
+            Write-Host "Downloading $url"
+            $client = [System.Net.Http.HttpClient]::new()
+            $client.Timeout = [TimeSpan]::FromMinutes(2)
+            try {
+              $candidate = $client.GetByteArrayAsync($url).GetAwaiter().GetResult()
+            } catch {
+              Write-Warning "Download failed: $($_.Exception.Message)"
+              $candidate = $null
+            } finally {
+              $client.Dispose()
+            }
+
+            if ($candidate -and $candidate.Length -gt 1MB) {
+              $bytes = $candidate
+              break
+            }
+          }
+          if (-not $bytes) {
+            throw 'Could not download Irvine.zip.'
+          }
+
+          # Extract only the headers and the 32-bit library. The archive also
+          # contains old prebuilt .exe files which we intentionally do not write.
+          $stream = [System.IO.MemoryStream]::new($bytes, $false)
+          $archive = [System.IO.Compression.ZipArchive]::new(
+            $stream, [System.IO.Compression.ZipArchiveMode]::Read)
+          try {
+            New-Item -ItemType Directory -Force 'C:\Irvine' | Out-Null
+            $names = @(
+              'Irvine32.inc',
+              'SmallWin.inc',
+              'VirtualKeys.inc',
+              'Macros.inc',
+              'GraphWin.inc',
+              'Irvine32.lib'
+            )
+            foreach ($name in $names) {
+              $entry = $archive.GetEntry("Irvine/$name")
+              if (-not $entry) {
+                throw "Irvine.zip does not contain Irvine/$name."
+              }
+              $source = $entry.Open()
+              $target = [System.IO.File]::Create((Join-Path 'C:\Irvine' $name))
+              try {
+                $source.CopyTo($target)
+              } finally {
+                $target.Dispose()
+                $source.Dispose()
+              }
+            }
+          } finally {
+            $archive.Dispose()
+            $stream.Dispose()
+          }
+
+          Get-ChildItem 'C:\Irvine' | Format-Table Name, Length
+
+      - name: Exclude build outputs from Defender
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, 'C:\Irvine' -ErrorAction Stop
+            Write-Host 'Defender exclusions configured.'
+          } catch {
+            Write-Warning "Could not configure Defender exclusions: $($_.Exception.Message)"
+          }
+
+      - name: Build and run exercises
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $root = Join-Path $env:GITHUB_WORKSPACE 'Intel-Assembly-Language-Programming-Exercises'
+          $outRoot = Join-Path $env:GITHUB_WORKSPACE 'build'
+          $irvine = 'C:\Irvine'
+          $libs = @('irvine32.lib', 'kernel32.lib', 'user32.lib')
+
+          # Programs made of more than one source file.
+          $multi = @(
+            [pscustomobject]@{ Name = 'Inputs'; Sources = @('Inputs_main.asm', '_differentinputs.asm') },
+            [pscustomobject]@{ Name = 'Largest'; Sources = @('Largest_main.asm', '_findlargest.asm', '_display.asm') },
+            [pscustomobject]@{ Name = 'Threes'; Sources = @('Threes_main.asm', '_findthrees.asm') },
+            [pscustomobject]@{ Name = 'Board'; Sources = @('Board_main.asm', '_drawboard.asm', '_drawrow.asm', '_drawsquare.asm') }
+          )
+          $multiMains = $multi | ForEach-Object { $_.Sources[0] }
+
+          # Every remaining .asm file is a standalone program. Files starting
+          # with an underscore are procedure modules and are not run directly.
+          $standalone = Get-ChildItem -Path $root -Filter '*.asm' |
+            Where-Object { $_.Name -notlike '_*' -and $multiMains -notcontains $_.Name } |
+            Sort-Object Name |
+            ForEach-Object { [pscustomobject]@{ Name = $_.BaseName; Sources = @($_.Name) } }
+
+          $programs = @($standalone) + $multi
+
+          # These programs read keyboard events through Irvine32. A headless
+          # runner has no console input buffer, so they are compiled but not run.
+          $interactive = @(
+            '5_4_SimpleAddition(2)',
+            '6_5-6_BooleanCalculator',
+            '6_8_MessageEncryption'
+          )
+
+          $results = [System.Collections.Generic.List[object]]::new()
+
+          try {
+            New-Item -ItemType Directory -Force $outRoot | Out-Null
+
+            foreach ($program in $programs) {
+              $name = $program.Name
+              $programDir = Join-Path $outRoot $name
+              New-Item -ItemType Directory -Force $programDir | Out-Null
+
+              $objects = @()
+              foreach ($sourceName in $program.Sources) {
+                $source = Join-Path $root $sourceName
+                $object = Join-Path $programDir ([IO.Path]::GetFileNameWithoutExtension($sourceName) + '.obj')
+                Write-Host "Assembling $sourceName"
+                & ml.exe /c /coff /nologo /W3 /I $irvine "/Fo$object" $source
+                if ($LASTEXITCODE -ne 0) {
+                  throw "ml.exe failed for $sourceName (exit code $LASTEXITCODE)."
+                }
+                $objects += $object
+              }
+
+              $exe = Join-Path $programDir "$name.exe"
+              Write-Host "Linking $name.exe"
+              $linkArgs = @(
+                '/nologo',
+                '/subsystem:console',
+                '/machine:x86',
+                '/SAFESEH:NO',
+                '/DYNAMICBASE:NO',
+                "/out:$exe",
+                "/libpath:$irvine"
+              ) + $objects + $libs
+              & link.exe @linkArgs
+              if ($LASTEXITCODE -ne 0) {
+                throw "link.exe failed for $name (exit code $LASTEXITCODE)."
+              }
+
+              [void]$results.Add([pscustomobject]@{
+                Name = $name
+                Build = 'PASS'
+                Run = 'not run'
+              })
+            }
+
+            foreach ($result in $results) {
+              if ($interactive -contains $result.Name) {
+                $result.Run = 'SKIP (interactive input)'
+                Write-Host "::notice title=$($result.Name)::Compiled successfully; runtime skipped because the program requires an interactive console (ReadChar/ReadString/WaitMsg)."
+                continue
+              }
+
+              $exe = Join-Path (Join-Path $outRoot $result.Name) "$($result.Name).exe"
+              Write-Host "Running $($result.Name)"
+
+              # Start the program in a hidden console with stdin set to NUL.
+              # Irvine32's Clrscr needs a real console output handle, while
+              # ReadConsole must fail immediately rather than wait for input.
+              $cmdLine = '/d /c ""{0}" < NUL"' -f $exe
+              $process = Start-Process -FilePath $env:ComSpec `
+                -ArgumentList $cmdLine `
+                -WindowStyle Hidden `
+                -PassThru `
+                -ErrorAction Stop
+
+              if (-not $process.WaitForExit(20000)) {
+                try { $process.Kill($true) } catch { }
+                throw "Program $($result.Name) timed out after 20 seconds."
+              }
+              $process.WaitForExit()
+
+              if ($process.ExitCode -ne 0) {
+                throw "Program $($result.Name) exited with code $($process.ExitCode)."
+              }
+
+              $result.Run = 'PASS'
+              Write-Host "PASS $($result.Name) (exit code 0)"
+            }
+          } catch {
+            Write-Host "::error::$($_.Exception.Message)"
+            throw
+          } finally {
+            $rows = foreach ($result in ($results | Sort-Object Name)) {
+              "| $($result.Name) | $($result.Build) | $($result.Run) |"
+            }
+            $passed = @($results | Where-Object { $_.Run -eq 'PASS' }).Count
+            $skipped = @($results | Where-Object { $_.Run -like 'SKIP*' }).Count
+            $summary = @(
+              '## Windows MASM build and run',
+              '',
+              'Toolchain: `ml.exe` (x86) + `link.exe` + Irvine32',
+              '',
+              '| Program | Build | Run |',
+              '| --- | --- | --- |'
+            ) + @($rows) + @(
+              '',
+              "**Built:** $($results.Count)/$($programs.Count) &nbsp;&nbsp; **Ran:** $passed &nbsp;&nbsp; **Skipped:** $skipped"
+            )
+            $summary -join "`n" |
+              Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+  source-checks:
+    name: ${{ matrix.os }} - source checks (Windows-only project)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate source layout, includes, and entry points
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path("Intel-Assembly-Language-Programming-Exercises")
+          project = root / "Intel-Assembly-Language-Programming-Exercises.vcxproj"
+          external_includes = {"Irvine32.inc"}
+
+          asm_files = sorted(root.glob("*.asm"))
+          inc_files = sorted(root.glob("*.inc"))
+          errors = []
+
+          # The project is MASM/Windows-only, but Linux and macOS use
+          # case-sensitive file systems. This catches INCLUDE case mistakes.
+          for path in asm_files + inc_files:
+              data = path.read_bytes()
+              bad = next((i for i, b in enumerate(data) if b > 0x7F), None)
+              if bad is not None:
+                  errors.append(f"{path}: non-ASCII byte 0x{data[bad]:02X} at offset {bad}")
+
+          include_re = re.compile(r"^\s*INCLUDE\s+(\S+)", re.IGNORECASE | re.MULTILINE)
+          for path in asm_files + inc_files:
+              text = path.read_text(encoding="ascii", errors="replace")
+              for target in include_re.findall(text):
+                  if target in external_includes:
+                      continue
+                  if not (path.parent / target).is_file() and not (root / target).is_file():
+                      errors.append(f"{path}: INCLUDE {target} not found with exact case")
+
+          main_re = re.compile(r"^\s*main\s+PROC\b", re.IGNORECASE | re.MULTILINE)
+          end_main_re = re.compile(r"^\s*END\s+main\s*$", re.IGNORECASE | re.MULTILINE)
+          end_re = re.compile(r"^\s*END\s*$", re.IGNORECASE | re.MULTILINE)
+          programs = []
+          for path in asm_files:
+              text = path.read_text(encoding="ascii", errors="replace")
+              if main_re.search(text):
+                  programs.append(path.name)
+                  if not end_main_re.search(text):
+                      errors.append(f"{path}: defines main but lacks 'END main'")
+              elif not end_re.search(text):
+                  errors.append(f"{path}: module lacks a terminating 'END'")
+
+          project_text = project.read_text(encoding="utf-8-sig", errors="replace")
+          for path in asm_files + inc_files:
+              if path.name not in project_text:
+                  errors.append(f"{path}: not referenced by {project.name}")
+
+          print(f"Checked {len(asm_files)} .asm and {len(inc_files)} .inc files")
+          print(f"Program entry points: {len(programs)}")
+          print("Includes resolve with exact case; all sources are ASCII; all files are in the Visual Studio project.")
+
+          if errors:
+              print("\nErrors:")
+              for error in errors:
+                  print(f"  - {error}")
+              sys.exit(1)
+
+          print("\nAll source checks passed.")
+          print("::notice title=Windows-only runtime::These sources target 32-bit Windows (MASM + Irvine32); no native build or run is possible on this runner.")
+          PY
+
+      - name: Explain platform support
+        shell: bash
+        run: |
+          {
+            echo "## Source checks on ${RUNNER_OS}"
+            echo ""
+            echo "This repository targets **32-bit Windows** (MASM + Irvine32)."
+            echo "A native build and run are only possible on Windows, so this job"
+            echo "validates source layout, exact-case includes, and entry points."
+            echo ""
+            echo "The \`windows-2022\` and \`windows-latest\` jobs assemble, link,"
+            echo "and execute the exercises with \`ml.exe\` and \`link.exe\`."
+          } >> "$GITHUB_STEP_SUMMARY"
