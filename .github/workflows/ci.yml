@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure MSVC x86 environment
         run: |
@@ -238,9 +238,11 @@ jobs:
                 -PassThru `
                 -ErrorAction Stop
 
-              if (-not $process.WaitForExit(20000)) {
+              # 5_8_ColourMatrix deliberately delays 100 ms per cell (256 cells),
+              # so allow up to two minutes before treating a program as hung.
+              if (-not $process.WaitForExit(120000)) {
                 try { $process.Kill($true) } catch { }
-                throw "Program $($result.Name) timed out after 20 seconds."
+                throw "Program $($result.Name) timed out after 120 seconds."
               }
               $process.WaitForExit()
 
@@ -288,7 +290,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate source layout, includes, and entry points
         shell: bash
